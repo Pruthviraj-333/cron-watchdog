@@ -19,3 +19,4 @@ fi
 
 echo "[info] Upload completed successfully."
 exit 0
+

@@ -14,3 +14,4 @@ sleep 60
 
 echo "[info] This line should never be reached if timeout killed the job."
 exit 0
+

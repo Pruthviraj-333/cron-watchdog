@@ -22,3 +22,4 @@ elif command -v service >/dev/null 2>&1; then
     sudo service cron start 2>/dev/null || sudo service crond start 2>/dev/null || true
 fi
 echo "Cron service restored."
+

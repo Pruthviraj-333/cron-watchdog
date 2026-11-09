@@ -5,3 +5,4 @@
 #
 echo "If you can execute this directly, chmod +x is set. If chmod -x is set, execution fails."
 exit 0
+

@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  lint-and-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies (shellcheck, jq, bats)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck jq bats
+
+      - name: Run shellcheck linting
+        run: |
+          echo "Running shellcheck across shell scripts..."
+          shellcheck -x bin/cronwatch
+          shellcheck -x tests/run_tests.sh
+          # Lint demo scripts excluding the intentional CRLF test fixture
+          shellcheck -x demo/fail_exit1.sh demo/fail_hang.sh demo/fail_path.sh demo/fail_perms.sh demo/simulate_stopped_cron.sh demo/run_all_demos.sh
+
+      - name: Run pure Bash test suite
+        run: |
+          chmod +x bin/cronwatch tests/run_tests.sh demo/*.sh
+          ./tests/run_tests.sh
+
+      - name: Run BATS test suite
+        run: |
+          bats tests/cronwatch.bats
+
+      - name: Run end-to-end sandbox demo
+        run: |
+          ./demo/run_all_demos.sh

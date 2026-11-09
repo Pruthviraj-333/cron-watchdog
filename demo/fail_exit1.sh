@@ -14,3 +14,4 @@ echo "pg_dump: error: Is the server running locally and accepting connections?" 
 echo "pg_dump: error: fatal: database backup aborted due to connection failure" >&2
 
 exit 1
+
