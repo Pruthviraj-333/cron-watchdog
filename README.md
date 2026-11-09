@@ -6,7 +6,7 @@
 [![CI](https://github.com/Pruthviraj-333/cron-watchdog/actions/workflows/ci.yml/badge.svg)](https://github.com/Pruthviraj-333/cron-watchdog/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Bash](https://img.shields.io/badge/Language-Pure%20Bash-4EAA25.svg)](https://www.gnu.org/software/bash/)
-[![AWS Free-Tier](https://img.shields.io/badge/AWS-Free--Tier%20Eligible-orange.svg)](https://aws.amazon.com/free/)
+[![AWS Free-Tier](https://img.shields.io/badge/AWS-Free--Tier%20Eligible-orange.svg)](#)
 
 ---
 
@@ -99,7 +99,7 @@ Automated environment diagnostic tool. Runs 7 host health checks:
 
 ## 4. Installation & Configuration
 
-### Quick Install (Ubuntu / Debian / Amazon Linux)
+### Quick Install (Ubuntu / Debian / RHEL / Linux)
 ```bash
 # 1. Clone repository
 git clone https://github.com/Pruthviraj-333/cron-watchdog.git /opt/cron-watchdog
@@ -163,7 +163,7 @@ cronwatch test-alert my-test-job
 
 ## 6. Live EC2 Test Run & Captured Verification
 
-The following outputs were captured from a **real test execution** on an Amazon EC2 Ubuntu 24.04 `t3.micro` instance in `ap-south-1`:
+The following outputs were captured from a **real test execution** on an EC2 Ubuntu 24.04 `t3.micro` instance in `ap-south-1`:
 
 ### 1. Automated Test Suite (10/10 Passed)
 ```
@@ -263,7 +263,7 @@ Nov 09 11:40:44 ip-172-31-6-47 cronwatch[4401]: WARNING: [cronwatch] Job 'ec2-pr
 
 ---
 
-## 7. Amazon Support Engineer Interview Questions & Concepts
+## 7. Linux Systems & Cloud Engineering Deep Dive (Technical Q&A)
 
 This project was engineered to demonstrate foundational Linux, systems engineering, and AWS troubleshooting skills. Here is how each concept maps to common interview questions:
 
@@ -288,7 +288,7 @@ This project was engineered to demonstrate foundational Linux, systems engineeri
 
 1. **Pure Bash + Coreutils:** Zero dependencies on external runtime engines like Python, Node.js, or Ruby. Runs out-of-the-box on minimal cloud distributions.
 2. **Standard FHS Paths with Environment Overrides:** Adheres to Linux Filesystem Hierarchy Standard (`/var/log`, `/var/lib`, `/etc`), but allows variable overrides (`CRONWATCH_LOG_DIR`, `CRONWATCH_STATE_DIR`) for unprivileged sandbox testing.
-3. **Structured JSON-Lines:** Every run logs a single-line JSON record for easy ingestion by central log management systems (Amazon CloudWatch Logs Agent, FluentBit, Datadog).
+3. **Structured JSON-Lines:** Every run logs a single-line JSON record for easy ingestion by central log management systems (CloudWatch Logs Agent, FluentBit, Datadog).
 4. **Noise Floor for Duration Anomalies:** Jobs must run for at least 15 seconds before triggering a $>3\times$ baseline anomaly warning, preventing alert fatigue from sub-second fluctuations (e.g. 0.1s to 0.4s).
 
 ---
@@ -302,5 +302,5 @@ This project was engineered to demonstrate foundational Linux, systems engineeri
 ### Future Work
 - [ ] Integration with AWS CloudWatch Embedded Metric Format (EMF) for automated dashboarding.
 - [ ] Native Slack / PagerDuty webhook dispatch alongside AWS SNS.
-- [ ] Distributed lock coordinator using Amazon DynamoDB or local flock to prevent overlapping runs.
+- [ ] Distributed lock coordinator using DynamoDB or local flock to prevent overlapping runs.
 
