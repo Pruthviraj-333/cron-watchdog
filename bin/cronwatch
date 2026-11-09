@@ -1,0 +1,301 @@
+#!/usr/bin/env bash
+#
+# cronwatch - Detect silent cron job failures on Linux
+#
+# A lightweight, pure-Bash tool built for Linux production environments.
+# Wraps cron jobs, tracks execution metrics, maintains per-job heartbeats,
+# and diagnoses silent failure modes.
+#
+
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# Defaults - can be overridden via environment variables for testing or custom paths
+CRONWATCH_LOG_DIR="${CRONWATCH_LOG_DIR:-/var/log/cron-watchdog}"
+CRONWATCH_LOG_FILE="${CRONWATCH_LOG_FILE:-${CRONWATCH_LOG_DIR}/jobs.log}"
+CRONWATCH_STATE_DIR="${CRONWATCH_STATE_DIR:-/var/lib/cron-watchdog}"
+CRONWATCH_HEARTBEAT_DIR="${CRONWATCH_HEARTBEAT_DIR:-${CRONWATCH_STATE_DIR}/heartbeats}"
+CRONWATCH_CONFIG_DIR="${CRONWATCH_CONFIG_DIR:-/etc/cron-watchdog}"
+CRONWATCH_CONFIG_FILE="${CRONWATCH_CONFIG_FILE:-${CRONWATCH_CONFIG_DIR}/jobs.conf}"
+
+# Helper: escape strings for pure-bash JSON serialization
+json_escape() {
+    local s="${1:-}"
+    # Escape backslashes first to prevent double-escaping subsequent characters
+    s="${s//\\/\\\\}"
+    # Escape double quotes
+    s="${s//\"/\\\"}"
+    # Escape control characters: newline, carriage return, tab
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
+# Subcommand: run
+# Usage: cronwatch run <job-name> [--timeout N] -- <command...>
+cmd_run() {
+    local job_name=""
+    local timeout_secs=""
+    local cmd=()
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --timeout)
+                if [[ $# -lt 2 ]]; then
+                    echo "cronwatch: error: --timeout requires an integer argument (seconds)" >&2
+                    return 2
+                fi
+                timeout_secs="$2"
+                shift 2
+                ;;
+            --)
+                shift
+                cmd=("$@")
+                break
+                ;;
+            -*)
+                echo "cronwatch: error: unknown option for run: $1" >&2
+                return 2
+                ;;
+            *)
+                if [[ -z "$job_name" ]]; then
+                    job_name="$1"
+                    shift
+                else
+                    echo "cronwatch: error: unexpected argument '$1'. Command must be preceded by '--'." >&2
+                    return 2
+                fi
+                ;;
+        esac
+    done
+
+    # Validation
+    if [[ -z "$job_name" ]]; then
+        echo "cronwatch: error: missing job name" >&2
+        echo "Usage: cronwatch run <job-name> [--timeout N] -- <command...>" >&2
+        return 2
+    fi
+
+    if ! [[ "$job_name" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+        echo "cronwatch: error: invalid job name '$job_name'. Must contain only alphanumeric, dash, dot, or underscore." >&2
+        return 2
+    fi
+
+    if [[ ${#cmd[@]} -eq 0 ]]; then
+        echo "cronwatch: error: no command specified to execute" >&2
+        echo "Usage: cronwatch run <job-name> [--timeout N] -- <command...>" >&2
+        return 2
+    fi
+
+    if [[ -n "$timeout_secs" ]]; then
+        if ! [[ "$timeout_secs" =~ ^[0-9]+$ ]] || [[ "$timeout_secs" -le 0 ]]; then
+            echo "cronwatch: error: --timeout must be a positive integer" >&2
+            return 2
+        fi
+    fi
+
+    # Record start time
+    local start_iso
+    local start_epoch
+    local end_iso
+    local end_epoch
+    local duration
+    local exit_code=0
+    local status="SUCCESS"
+
+    start_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    start_epoch=$(date +%s)
+
+    # Secure temp file for stderr capture
+    local stderr_tmp
+    stderr_tmp=$(mktemp "${TMPDIR:-/tmp}/cronwatch-stderr.XXXXXX" 2>/dev/null || echo "/tmp/cronwatch-stderr.$$.$RANDOM")
+    touch "$stderr_tmp" 2>/dev/null || true
+
+    cleanup() {
+        if [[ -n "${stderr_tmp:-}" && -f "$stderr_tmp" ]]; then
+            rm -f "$stderr_tmp"
+        fi
+    }
+    trap cleanup EXIT INT TERM
+
+    # Execute wrapped command
+    if [[ -n "$timeout_secs" ]]; then
+        if command -v timeout >/dev/null 2>&1; then
+            # Use -k 10 to send SIGKILL 10s after SIGTERM if the process hangs
+            timeout -k 10 "${timeout_secs}" "${cmd[@]}" 2>"$stderr_tmp" || exit_code=$?
+            if [[ "$exit_code" -eq 124 || "$exit_code" -eq 137 ]]; then
+                status="TIMED_OUT"
+            elif [[ "$exit_code" -ne 0 ]]; then
+                status="FAILED"
+            fi
+        else
+            echo "cronwatch: warning: 'timeout' utility not found; running command without timeout" >&2
+            "${cmd[@]}" 2>"$stderr_tmp" || exit_code=$?
+            if [[ "$exit_code" -ne 0 ]]; then
+                status="FAILED"
+            fi
+        fi
+    else
+        "${cmd[@]}" 2>"$stderr_tmp" || exit_code=$?
+        if [[ "$exit_code" -ne 0 ]]; then
+            status="FAILED"
+        fi
+    fi
+
+    # Record end time & duration
+    end_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    end_epoch=$(date +%s)
+    duration=$(( end_epoch - start_epoch ))
+    if [[ "$duration" -lt 0 ]]; then
+        duration=0
+    fi
+
+    # Echo original stderr back to stream so caller/sysadmin sees it as normal
+    if [[ -s "$stderr_tmp" ]]; then
+        cat "$stderr_tmp" >&2
+    fi
+
+    # Capture last 20 lines of stderr for alerting & logging
+    local stderr_tail=""
+    if [[ -f "$stderr_tmp" ]]; then
+        stderr_tail=$(tail -n 20 "$stderr_tmp")
+    fi
+
+    # On success: update per-job heartbeat file
+    if [[ "$status" == "SUCCESS" ]]; then
+        if ! mkdir -p "$CRONWATCH_HEARTBEAT_DIR" 2>/dev/null; then
+            echo "cronwatch: warning: cannot create heartbeat directory: $CRONWATCH_HEARTBEAT_DIR" >&2
+        else
+            local heartbeat_file="${CRONWATCH_HEARTBEAT_DIR}/${job_name}"
+            local heartbeat_tmp="${heartbeat_file}.tmp.$$"
+            cat <<EOF > "$heartbeat_tmp" 2>/dev/null || true
+JOB_NAME=${job_name}
+LAST_SUCCESS_ISO=${end_iso}
+LAST_SUCCESS_EPOCH=${end_epoch}
+LAST_DURATION_SECONDS=${duration}
+EOF
+            if [[ -f "$heartbeat_tmp" ]]; then
+                mv -f "$heartbeat_tmp" "$heartbeat_file" 2>/dev/null || touch "$heartbeat_file" 2>/dev/null || true
+            else
+                touch "$heartbeat_file" 2>/dev/null || true
+            fi
+        fi
+    fi
+
+    # Log execution result to JSON-lines log file
+    if ! mkdir -p "$CRONWATCH_LOG_DIR" 2>/dev/null; then
+        echo "cronwatch: error: cannot create log directory: $CRONWATCH_LOG_DIR" >&2
+    fi
+
+    local log_entry=""
+    if command -v jq >/dev/null 2>&1; then
+        log_entry=$(jq -c -n \
+            --arg ts "$end_iso" \
+            --arg job "$job_name" \
+            --arg start "$start_iso" \
+            --arg end "$end_iso" \
+            --argjson dur "$duration" \
+            --argjson code "$exit_code" \
+            --arg status "$status" \
+            --arg stderr "$stderr_tail" \
+            '{timestamp: $ts, job_name: $job, start_time: $start, end_time: $end, duration_seconds: $dur, exit_code: $code, status: $status, stderr_tail: $stderr}')
+    else
+        local escaped_job
+        local escaped_stderr
+        escaped_job=$(json_escape "$job_name")
+        escaped_stderr=$(json_escape "$stderr_tail")
+        log_entry=$(printf '{"timestamp":"%s","job_name":"%s","start_time":"%s","end_time":"%s","duration_seconds":%d,"exit_code":%d,"status":"%s","stderr_tail":"%s"}' \
+            "$end_iso" "$escaped_job" "$start_iso" "$end_iso" "$duration" "$exit_code" "$status" "$escaped_stderr")
+    fi
+
+    if ! printf '%s\n' "$log_entry" >> "$CRONWATCH_LOG_FILE" 2>/dev/null; then
+        echo "cronwatch: error: failed to write log entry to $CRONWATCH_LOG_FILE" >&2
+    fi
+
+    # Propagate exit code to preserve normal cron notification semantics
+    return "$exit_code"
+}
+
+# Subcommand stubs for future stages
+cmd_check() {
+    echo "cronwatch: 'check' will be implemented in Stage 2" >&2
+    return 1
+}
+
+cmd_doctor() {
+    echo "cronwatch: 'doctor' will be implemented in Stage 3" >&2
+    return 1
+}
+
+usage() {
+    cat <<EOF
+cronwatch v${VERSION} - Detect silent cron job failures on Linux
+
+Usage:
+  cronwatch <command> [arguments...]
+
+Commands:
+  run <job-name> [--timeout N] -- <command...>
+      Execute a cron command wrapped with monitoring. Records metrics to
+      $CRONWATCH_LOG_FILE and updates heartbeat on success.
+  check
+      Inspect configured jobs, detect missed schedules, failures, and slow runs.
+  doctor
+      Diagnose common cron issues (service status, permissions, CRLF, PATH, etc.).
+  version
+      Print version information.
+  help
+      Show this help message.
+
+Environment Variables:
+  CRONWATCH_LOG_DIR       Directory for logs (default: /var/log/cron-watchdog)
+  CRONWATCH_LOG_FILE      Log file path (default: <CRONWATCH_LOG_DIR>/jobs.log)
+  CRONWATCH_STATE_DIR     Directory for state (default: /var/lib/cron-watchdog)
+  CRONWATCH_HEARTBEAT_DIR Heartbeats directory (default: <CRONWATCH_STATE_DIR>/heartbeats)
+  CRONWATCH_CONFIG_DIR    Configuration directory (default: /etc/cron-watchdog)
+  CRONWATCH_CONFIG_FILE   Configuration file path (default: <CRONWATCH_CONFIG_DIR>/jobs.conf)
+EOF
+}
+
+main() {
+    if [[ $# -lt 1 ]]; then
+        usage
+        exit 1
+    fi
+
+    local subcommand="$1"
+    shift
+
+    case "$subcommand" in
+        run)
+            cmd_run "$@"
+            exit $?
+            ;;
+        check)
+            cmd_check "$@"
+            exit $?
+            ;;
+        doctor)
+            cmd_doctor "$@"
+            exit $?
+            ;;
+        version|--version|-v)
+            echo "cronwatch version ${VERSION}"
+            exit 0
+            ;;
+        help|--help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "cronwatch: error: unknown command '$subcommand'" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

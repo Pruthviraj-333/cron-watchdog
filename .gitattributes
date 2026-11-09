@@ -1,0 +1,5 @@
+# Ensure LF line endings on all platforms (critical for Linux shell scripts)
+* text=auto eol=lf
+*.sh text eol=lf
+bin/* text eol=lf
+tests/*.bats text eol=lf
