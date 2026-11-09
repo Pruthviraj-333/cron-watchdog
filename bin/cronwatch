@@ -68,8 +68,10 @@ ${details}"
     fi
 }
 
+# ==============================================================================
 # Subcommand: run
 # Usage: cronwatch run <job-name> [--timeout N] -- <command...>
+# ==============================================================================
 cmd_run() {
     local job_name=""
     local timeout_secs=""
@@ -254,8 +256,10 @@ EOF
     return "$exit_code"
 }
 
+# ==============================================================================
 # Subcommand: check
 # Usage: cronwatch check [--quiet]
+# ==============================================================================
 cmd_check() {
     local quiet_mode=false
 
@@ -491,10 +495,351 @@ cmd_check() {
     return 0
 }
 
-# Subcommand stub for future stage
+# ==============================================================================
+# Subcommand: doctor
+# Usage: cronwatch doctor [optional-scripts...]
+# ==============================================================================
+
+# Doctor Check 1: Cron service status (systemctl / service / pgrep)
+doctor_check_service() {
+    local svc_active=false
+    local svc_name=""
+
+    if command -v systemctl >/dev/null 2>&1; then
+        for s in cron crond; do
+            if systemctl is-active --quiet "$s" 2>/dev/null; then
+                svc_active=true
+                svc_name="$s"
+                break
+            fi
+        done
+    fi
+
+    # Fallback to service command or pgrep
+    if [[ "$svc_active" == false ]]; then
+        if command -v service >/dev/null 2>&1; then
+            if service cron status >/dev/null 2>&1; then
+                svc_active=true
+                svc_name="cron"
+            elif service crond status >/dev/null 2>&1; then
+                svc_active=true
+                svc_name="crond"
+            fi
+        fi
+        if [[ "$svc_active" == false ]]; then
+            if pgrep -x cron >/dev/null 2>&1; then
+                svc_active=true
+                svc_name="cron (process)"
+            elif pgrep -x crond >/dev/null 2>&1; then
+                svc_active=true
+                svc_name="crond (process)"
+            fi
+        fi
+    fi
+
+    if [[ "$svc_active" == true ]]; then
+        echo "[PASS] Cron Service: Active and running (${svc_name})"
+        return 0
+    else
+        echo "[FAIL] Cron Service: Cron daemon is stopped or not active"
+        echo "       Hint: Run 'sudo systemctl enable --now cron' (or 'sudo systemctl enable --now crond') to start the service."
+        return 1
+    fi
+}
+
+# Doctor Check 2: Recent cron entries in journalctl / syslog
+doctor_check_logs() {
+    local entries_found=0
+    local log_source=""
+
+    # Try journalctl first
+    if command -v journalctl >/dev/null 2>&1; then
+        local jcount
+        jcount=$(journalctl -u cron -u crond --since "24 hours ago" --no-pager -n 50 2>/dev/null | grep -c -i "cron" || true)
+        if [[ "$jcount" -gt 0 ]]; then
+            entries_found="$jcount"
+            log_source="journalctl"
+        fi
+    fi
+
+    # Try syslog / cron log files
+    if [[ "$entries_found" -eq 0 ]]; then
+        for lf in /var/log/syslog /var/log/cron /var/log/messages; do
+            if [[ -r "$lf" ]]; then
+                local fcount
+                fcount=$(grep -c -E "(CRON\[|crond\[)" "$lf" 2>/dev/null || true)
+                if [[ "$fcount" -gt 0 ]]; then
+                    entries_found="$fcount"
+                    log_source="$lf"
+                    break
+                fi
+            fi
+        done
+    fi
+
+    if [[ "$entries_found" -gt 0 ]]; then
+        echo "[PASS] Syslog/Journal: Cron execution events detected in ${log_source} (${entries_found} recent entries)"
+        return 0
+    else
+        echo "[WARN] Syslog/Journal: No recent cron events found in system logs"
+        echo "       Hint: Verify scheduled jobs exist with 'crontab -l' and inspect /var/log/syslog or 'journalctl -u cron'."
+        return 0
+    fi
+}
+
+# Doctor Check 3: Crontab trailing newline check
+doctor_check_trailing_newline() {
+    local missing=()
+    local files_to_check=()
+
+    # System crontabs
+    [[ -f /etc/crontab ]] && files_to_check+=(/etc/crontab)
+    if [[ -d /etc/cron.d ]]; then
+        for f in /etc/cron.d/*; do
+            [[ -f "$f" ]] && files_to_check+=("$f")
+        done
+    fi
+
+    for cf in "${files_to_check[@]}"; do
+        if [[ -r "$cf" && -s "$cf" ]]; then
+            local last_char
+            last_char=$(tail -c 1 "$cf" 2>/dev/null || true)
+            if [[ "$last_char" != $'\n' ]]; then
+                missing+=("$cf")
+            fi
+        fi
+    done
+
+    # Check user crontab if available
+    if command -v crontab >/dev/null 2>&1; then
+        local user_cron
+        user_cron=$(crontab -l 2>/dev/null || true)
+        if [[ -n "$user_cron" ]]; then
+            local last_cron_char="${user_cron: -1}"
+            if [[ "$last_cron_char" != $'\n' ]]; then
+                missing+=("user crontab (crontab -l)")
+            fi
+        fi
+    fi
+
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        echo "[PASS] Crontab Newline: Trailing newline present in crontab files"
+        return 0
+    else
+        echo "[FAIL] Crontab Newline: File missing trailing newline (Vixie cron silently drops the last line!):"
+        for m in "${missing[@]}"; do
+            echo "       - $m"
+        done
+        echo "       Hint: Run 'echo \"\" >> <file>' or ensure your text editor inserts a trailing newline."
+        return 1
+    fi
+}
+
+# Doctor Check 4: Windows CRLF line endings (\r\n) in scripts
+doctor_check_crlf() {
+    local target_scripts=("$@")
+    local crlf_found=()
+
+    for s in "${target_scripts[@]}"; do
+        if [[ -f "$s" && -r "$s" ]]; then
+            if grep -q $'\r' "$s" 2>/dev/null; then
+                crlf_found+=("$s")
+            fi
+        fi
+    done
+
+    if [[ ${#crlf_found[@]} -eq 0 ]]; then
+        echo "[PASS] Line Endings: No Windows CRLF (\\r\\n) line endings detected in checked scripts"
+        return 0
+    else
+        echo "[FAIL] Line Endings: Windows CRLF (\\r\\n) line endings detected (causes '/bin/bash^M: bad interpreter'):"
+        for f in "${crlf_found[@]}"; do
+            echo "       - $f"
+        done
+        echo "       Hint: Run 'sed -i \"s/\\r$//\" <script>' or 'dos2unix <script>' to convert to Unix LF."
+        return 1
+    fi
+}
+
+# Doctor Check 5: Script executable permissions (+x)
+doctor_check_executable() {
+    local target_scripts=("$@")
+    local non_exec=()
+
+    for s in "${target_scripts[@]}"; do
+        if [[ -f "$s" ]]; then
+            if [[ ! -x "$s" ]]; then
+                non_exec+=("$s")
+            fi
+        fi
+    done
+
+    if [[ ${#non_exec[@]} -eq 0 ]]; then
+        echo "[PASS] Executable Bit: All checked script files have executable (+x) permissions"
+        return 0
+    else
+        echo "[FAIL] Executable Bit: Script is not marked executable:"
+        for f in "${non_exec[@]}"; do
+            echo "       - $f"
+        done
+        echo "       Hint: Run 'chmod +x <script>' so cron can execute it."
+        return 1
+    fi
+}
+
+# Doctor Check 6: Permissions and ownership on files cron runs
+doctor_check_permissions() {
+    local insecure=()
+    local cron_dirs=(/etc/crontab /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly)
+
+    for item in "${cron_dirs[@]}"; do
+        if [[ -d "$item" ]]; then
+            for f in "$item"/*; do
+                [[ -f "$f" ]] || continue
+                local owner_uid=""
+                owner_uid=$(stat -c %u "$f" 2>/dev/null || stat -f %u "$f" 2>/dev/null || true)
+                if [[ -n "$owner_uid" && "$owner_uid" -ne 0 ]]; then
+                    insecure+=("$f (owned by UID $owner_uid, must be root/0)")
+                fi
+                local mode=""
+                mode=$(stat -c %a "$f" 2>/dev/null || stat -f %Lp "$f" 2>/dev/null || true)
+                if [[ -n "$mode" ]]; then
+                    # Check group or other write bit (2, 3, 6, 7)
+                    if [[ "$mode" =~ [2367][0-9]$ || "$mode" =~ [2367]$ ]]; then
+                        insecure+=("$f (mode ${mode} is group/world-writable)")
+                    fi
+                fi
+            done
+        elif [[ -f "$item" ]]; then
+            local mode=""
+            mode=$(stat -c %a "$item" 2>/dev/null || stat -f %Lp "$item" 2>/dev/null || true)
+            if [[ -n "$mode" && ( "$mode" =~ [2367][0-9]$ || "$mode" =~ [2367]$ ) ]]; then
+                insecure+=("$item (mode ${mode} is group/world-writable)")
+            fi
+        fi
+    done
+
+    if [[ ${#insecure[@]} -eq 0 ]]; then
+        echo "[PASS] File Permissions: System cron directory files have secure ownership & permissions"
+        return 0
+    else
+        echo "[FAIL] File Permissions: Cron refuses to run files that are not owned by root or are group/world-writable:"
+        for f in "${insecure[@]}"; do
+            echo "       - $f"
+        done
+        echo "       Hint: Run 'sudo chown root:root <file> && sudo chmod 644 <file>'. Cron rejects 'BAD FILE MODE'."
+        return 1
+    fi
+}
+
+# Doctor Check 7: PATH & environment differences
+doctor_check_path_env() {
+    local issues=()
+    local cron_default_path="/usr/bin:/bin"
+    local common_tools=(aws jq logger timeout curl python3)
+
+    for tool in "${common_tools[@]}"; do
+        if command -v "$tool" >/dev/null 2>&1; then
+            local tool_path
+            tool_path=$(command -v "$tool")
+            if [[ "$tool_path" != /usr/bin/* && "$tool_path" != /bin/* ]]; then
+                issues+=("'$tool' is at $tool_path (outside cron default PATH: $cron_default_path)")
+            fi
+        fi
+    done
+
+    if [[ ${#issues[@]} -eq 0 ]]; then
+        echo "[PASS] PATH & Environment: Standard tools are accessible in cron's default search PATH"
+        return 0
+    else
+        echo "[WARN] PATH & Environment: Tools located outside cron's default search PATH ($cron_default_path):"
+        for iss in "${issues[@]}"; do
+            echo "       - $iss"
+        done
+        echo "       Hint: Add 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' at the top of crontab, or use absolute paths."
+        return 0
+    fi
+}
+
 cmd_doctor() {
-    echo "cronwatch: 'doctor' will be implemented in Stage 3" >&2
-    return 1
+    echo "============================================================"
+    echo "          cronwatch doctor - Cron Health Diagnostics        "
+    echo "============================================================"
+
+    local pass_count=0
+    local fail_count=0
+    local warn_count=0
+
+    # Collect target scripts to check
+    local scripts_to_check=()
+    if [[ $# -gt 0 ]]; then
+        scripts_to_check=("$@")
+    else
+        # Auto-discover scripts from cron directories and demo folder
+        for d in /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly demo; do
+            if [[ -d "$d" ]]; then
+                for f in "$d"/*; do
+                    [[ -f "$f" ]] && scripts_to_check+=("$f")
+                done
+            fi
+        done
+    fi
+
+    # Run Check 1: Cron Service
+    if doctor_check_service; then
+        pass_count=$(( pass_count + 1 ))
+    else
+        fail_count=$(( fail_count + 1 ))
+    fi
+
+    # Run Check 2: Syslog / Journal Activity
+    if doctor_check_logs; then
+        pass_count=$(( pass_count + 1 ))
+    fi
+
+    # Run Check 3: Crontab Trailing Newline
+    if doctor_check_trailing_newline; then
+        pass_count=$(( pass_count + 1 ))
+    else
+        fail_count=$(( fail_count + 1 ))
+    fi
+
+    # Run Check 4: CRLF Line Endings
+    if doctor_check_crlf "${scripts_to_check[@]}"; then
+        pass_count=$(( pass_count + 1 ))
+    else
+        fail_count=$(( fail_count + 1 ))
+    fi
+
+    # Run Check 5: Executable Bit
+    if doctor_check_executable "${scripts_to_check[@]}"; then
+        pass_count=$(( pass_count + 1 ))
+    else
+        fail_count=$(( fail_count + 1 ))
+    fi
+
+    # Run Check 6: Cron File Permissions
+    if doctor_check_permissions; then
+        pass_count=$(( pass_count + 1 ))
+    else
+        fail_count=$(( fail_count + 1 ))
+    fi
+
+    # Run Check 7: PATH & Environment Differences
+    if doctor_check_path_env; then
+        pass_count=$(( pass_count + 1 ))
+    fi
+
+    echo "============================================================"
+    echo "Diagnostic Summary: ${pass_count} PASS, ${fail_count} FAIL, ${warn_count} WARN"
+
+    if [[ "$fail_count" -gt 0 ]]; then
+        echo "Status: Issues detected that could cause silent cron job failures."
+        return 1
+    else
+        echo "Status: System is healthy for cron job execution."
+        return 0
+    fi
 }
 
 usage() {
@@ -511,8 +856,9 @@ Commands:
   check [--quiet]
       Inspect configured jobs in $CRONWATCH_CONFIG_FILE.
       Detects missed schedules, exit errors, timeouts, and slow runs.
-  doctor
-      Diagnose common cron issues (service status, permissions, CRLF, PATH, etc.).
+  doctor [script...]
+      Diagnose common causes of silent cron failure (service status,
+      CRLF, permissions, trailing newlines, PATH/env differences).
   version
       Print version information.
   help
