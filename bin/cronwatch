@@ -47,7 +47,7 @@ json_escape() {
 
 # Global cleanup handler for temporary files on script exit or termination
 _CRONWATCH_STDERR_TMP=""
-# shellcheck disable=SC2317
+# shellcheck disable=SC2329,SC2317
 cronwatch_cleanup() {
     if [[ -n "${_CRONWATCH_STDERR_TMP:-}" && -f "$_CRONWATCH_STDERR_TMP" ]]; then
         rm -f "$_CRONWATCH_STDERR_TMP"
