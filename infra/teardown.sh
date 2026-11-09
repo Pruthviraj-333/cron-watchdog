@@ -21,3 +21,4 @@ echo "Running terraform destroy..."
 terraform destroy -auto-approve
 
 echo "Teardown complete. All AWS resources deleted."
+

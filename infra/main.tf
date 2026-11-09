@@ -143,7 +143,10 @@ resource "aws_instance" "vm" {
               #!/bin/bash
               set -ex
               apt-get update
-              apt-get install -y jq bats shellcheck git awscli
+              apt-get install -y jq bats shellcheck git curl unzip
+              curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip"
+              unzip -q /tmp/awscliv2.zip -d /tmp
+              /tmp/aws/install
               mkdir -p /var/log/cron-watchdog /var/lib/cron-watchdog/heartbeats /etc/cron-watchdog
               chmod 755 /var/log/cron-watchdog /var/lib/cron-watchdog /etc/cron-watchdog
               echo "CRONWATCH_SNS_TOPIC_ARN=${aws_sns_topic.alerts.arn}" > /etc/cron-watchdog/cronwatch.env
@@ -154,3 +157,4 @@ resource "aws_instance" "vm" {
     Name = "cron-watchdog-test-node"
   }
 }
+

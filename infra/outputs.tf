@@ -22,3 +22,4 @@ output "ssm_session_command" {
   description = "AWS SSM Session Manager connection command (secure, no open ports required)"
   value       = "aws ssm start-session --region ${var.aws_region} --target ${aws_instance.vm.id}"
 }
+

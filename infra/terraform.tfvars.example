@@ -7,3 +7,4 @@ operator_ip        = "103.151.234.231/32"
 instance_type      = "t3.micro"
 key_name           = "key_pair_mum"
 monthly_budget_usd = "5.0"
+
