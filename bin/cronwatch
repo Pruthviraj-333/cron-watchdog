@@ -4,21 +4,32 @@
 #
 # A lightweight, pure-Bash tool built for Linux production environments.
 # Wraps cron jobs, tracks execution metrics, maintains per-job heartbeats,
-# detects silent failures, and diagnoses host misconfigurations.
+# detects silent failures, alerts via syslog/SNS, and diagnoses host misconfigurations.
 #
 
 set -euo pipefail
 
 VERSION="1.0.0"
 
-# Defaults - can be overridden via environment variables for testing or custom paths
+# Defaults - can be overridden via environment variables or config file
+CRONWATCH_CONFIG_DIR="${CRONWATCH_CONFIG_DIR:-/etc/cron-watchdog}"
+CRONWATCH_CONFIG_FILE="${CRONWATCH_CONFIG_FILE:-${CRONWATCH_CONFIG_DIR}/jobs.conf}"
+
+# Source environment variables from configuration files if present
+if [[ -f "${CRONWATCH_CONFIG_DIR}/cronwatch.env" ]]; then
+    # shellcheck source=/dev/null
+    source "${CRONWATCH_CONFIG_DIR}/cronwatch.env"
+elif [[ -f "/etc/default/cronwatch" ]]; then
+    # shellcheck source=/dev/null
+    source "/etc/default/cronwatch"
+fi
+
 CRONWATCH_LOG_DIR="${CRONWATCH_LOG_DIR:-/var/log/cron-watchdog}"
 CRONWATCH_LOG_FILE="${CRONWATCH_LOG_FILE:-${CRONWATCH_LOG_DIR}/jobs.log}"
 CRONWATCH_STATE_DIR="${CRONWATCH_STATE_DIR:-/var/lib/cron-watchdog}"
 CRONWATCH_HEARTBEAT_DIR="${CRONWATCH_HEARTBEAT_DIR:-${CRONWATCH_STATE_DIR}/heartbeats}"
-CRONWATCH_CONFIG_DIR="${CRONWATCH_CONFIG_DIR:-/etc/cron-watchdog}"
-CRONWATCH_CONFIG_FILE="${CRONWATCH_CONFIG_FILE:-${CRONWATCH_CONFIG_DIR}/jobs.conf}"
 CRONWATCH_SNS_TOPIC_ARN="${CRONWATCH_SNS_TOPIC_ARN:-}"
+AWS_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-ap-south-1}}"
 
 # Helper: escape strings for pure-bash JSON serialization
 json_escape() {
@@ -34,37 +45,91 @@ json_escape() {
     printf '%s' "$s"
 }
 
-# Helper: send alert via syslog (logger) and optionally AWS SNS (Stage 4)
+# Helper: send alert via syslog (logger) and optionally AWS SNS
+# Uses EC2 IAM instance profile credentials (IMDSv2) automatically - never access keys.
 send_alert() {
     local job_name="$1"
     local alert_type="$2"
     local message="$3"
     local details="${4:-}"
+    local stderr_tail="${5:-}"
+    local severity="${6:-CRITICAL}"
 
-    local log_msg="CRITICAL: [cronwatch] Job '${job_name}' alert ${alert_type}: ${message}"
+    local timestamp
+    timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    local host_name
+    host_name=$(hostname 2>/dev/null || uname -n 2>/dev/null || echo "unknown-host")
+
+    local syslog_pri="user.err"
+    if [[ "$severity" == "WARNING" || "$severity" == "WARN" ]]; then
+        syslog_pri="user.warning"
+    fi
+
+    local log_msg="${severity}: [cronwatch] Job '${job_name}' alert ${alert_type}: ${message}"
     if [[ -n "$details" ]]; then
         log_msg="${log_msg} | Details: ${details}"
     fi
 
-    # Always log via logger (syslog / journald)
+    # 1. Always log via logger (syslog / systemd journal)
     if command -v logger >/dev/null 2>&1; then
-        logger -t cronwatch -p user.err "$log_msg" 2>/dev/null || true
+        logger -t cronwatch -p "$syslog_pri" "$log_msg" 2>/dev/null || true
     fi
 
-    # AWS SNS dispatch will be wired in Stage 4
-    if [[ -n "$CRONWATCH_SNS_TOPIC_ARN" ]] && command -v aws >/dev/null 2>&1; then
-        local sns_subject="[cronwatch alert] ${job_name}: ${alert_type}"
-        local sns_body="Host: $(hostname 2>/dev/null || echo 'unknown')
-Job: ${job_name}
-Alert: ${alert_type}
-Message: ${message}
-Timestamp: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    # 2. Publish to AWS SNS if Topic ARN is configured
+    if [[ -n "${CRONWATCH_SNS_TOPIC_ARN:-}" ]]; then
+        if command -v aws >/dev/null 2>&1; then
+            local sns_subject="[cronwatch ${severity}] ${job_name}: ${alert_type}"
+            # SNS subject maximum allowed length is 100 characters in AWS
+            if [[ ${#sns_subject} -gt 100 ]]; then
+                sns_subject="${sns_subject:0:97}..."
+            fi
 
-${details}"
-        aws sns publish \
-            --topic-arn "$CRONWATCH_SNS_TOPIC_ARN" \
-            --subject "$sns_subject" \
-            --message "$sns_body" >/dev/null 2>&1 || true
+            local sns_body="CRON-WATCHDOG ALERT NOTIFICATION
+============================================================
+Severity:  ${severity}
+Job Name:  ${job_name}
+Alert:     ${alert_type}
+Host:      ${host_name}
+Timestamp: ${timestamp}
+============================================================
+
+SUMMARY:
+${message}
+
+DETAILS:
+${details:-None provided}
+"
+            if [[ -n "$stderr_tail" ]]; then
+                sns_body="${sns_body}
+STDERR TAIL (Last lines):
+------------------------------------------------------------
+${stderr_tail}
+------------------------------------------------------------
+"
+            fi
+
+            sns_body="${sns_body}
+RECOMMENDED ACTIONS:
+1. Log into server: ssh ${host_name}
+2. Run diagnostic tool: cronwatch doctor
+3. Inspect job history: tail -n 50 ${CRONWATCH_LOG_FILE}
+4. Inspect system logs: journalctl -t cronwatch -n 50
+"
+
+            # Publish using EC2 instance profile role credentials
+            if ! aws sns publish \
+                --region "$AWS_REGION" \
+                --topic-arn "$CRONWATCH_SNS_TOPIC_ARN" \
+                --subject "$sns_subject" \
+                --message "$sns_body" >/dev/null 2>&1; then
+                if command -v logger >/dev/null 2>&1; then
+                    logger -t cronwatch -p user.err "cronwatch: failed to publish alert to SNS topic ${CRONWATCH_SNS_TOPIC_ARN}" 2>/dev/null || true
+                fi
+                echo "cronwatch: warning: failed to publish alert to AWS SNS topic: ${CRONWATCH_SNS_TOPIC_ARN}" >&2
+            fi
+        else
+            echo "cronwatch: warning: AWS CLI not installed; skipped SNS alert publication" >&2
+        fi
     fi
 }
 
@@ -356,14 +421,14 @@ cmd_check() {
                 job_failed=true
                 local issue_msg="MISSED_HEARTBEAT (last success ${age_minutes}m ago at ${last_success_iso:-unknown}, max allowed ${max_age_min}m)"
                 job_issues+=("$issue_msg")
-                send_alert "$job_name" "MISSED_HEARTBEAT" "$issue_msg" "Heartbeat file: $heartbeat_file"
+                send_alert "$job_name" "MISSED_HEARTBEAT" "$issue_msg" "Heartbeat file: $heartbeat_file" "" "CRITICAL"
             fi
         else
             # Heartbeat file does not exist
             job_failed=true
             local issue_msg="NEVER_RAN (no heartbeat file found at ${heartbeat_file})"
             job_issues+=("$issue_msg")
-            send_alert "$job_name" "NEVER_RAN" "$issue_msg" "Heartbeat file missing"
+            send_alert "$job_name" "NEVER_RAN" "$issue_msg" "Heartbeat file missing" "" "CRITICAL"
         fi
 
         # -------------------------------------------------------------
@@ -410,7 +475,7 @@ cmd_check() {
                 if [[ -n "$latest_stderr" ]]; then
                     job_details+=("stderr: ${latest_stderr}")
                 fi
-                send_alert "$job_name" "EXIT_NONZERO" "$fail_msg" "Stderr tail: ${latest_stderr}"
+                send_alert "$job_name" "EXIT_NONZERO" "$fail_msg" "Failed with exit code ${latest_exit_code}" "$latest_stderr" "CRITICAL"
             elif [[ "$latest_status" == "TIMED_OUT" ]]; then
                 job_failed=true
                 local timeout_msg="TIMED_OUT (killed after ${latest_duration}s at ${latest_time})"
@@ -418,7 +483,7 @@ cmd_check() {
                 if [[ -n "$latest_stderr" ]]; then
                     job_details+=("stderr: ${latest_stderr}")
                 fi
-                send_alert "$job_name" "TIMED_OUT" "$timeout_msg" "Stderr tail: ${latest_stderr}"
+                send_alert "$job_name" "TIMED_OUT" "$timeout_msg" "Process exceeded timeout duration" "$latest_stderr" "CRITICAL"
             fi
 
             # -------------------------------------------------------------
@@ -430,7 +495,7 @@ cmd_check() {
                     job_warning=true
                     local dur_msg="DURATION_EXCEEDED (last run took ${latest_duration}s, configured max ${max_duration_sec}s)"
                     job_issues+=("$dur_msg")
-                    send_alert "$job_name" "DURATION_EXCEEDED" "$dur_msg" ""
+                    send_alert "$job_name" "DURATION_EXCEEDED" "$dur_msg" "Configured maximum: ${max_duration_sec}s" "" "WARNING"
                 fi
             fi
 
@@ -451,7 +516,7 @@ cmd_check() {
                     job_warning=true
                     local anomaly_msg="DURATION_ANOMALY (last run took ${latest_duration}s, baseline average is ${dur_avg}s [>3x])"
                     job_issues+=("$anomaly_msg")
-                    send_alert "$job_name" "DURATION_ANOMALY" "$anomaly_msg" "Historical samples: ${past_durations[*]}"
+                    send_alert "$job_name" "DURATION_ANOMALY" "$anomaly_msg" "Historical samples: ${past_durations[*]}" "" "WARNING"
                 fi
             fi
         fi
@@ -842,6 +907,26 @@ cmd_doctor() {
     fi
 }
 
+# ==============================================================================
+# Subcommand: test-alert
+# Usage: cronwatch test-alert [job-name]
+# ==============================================================================
+cmd_test_alert() {
+    local job_name="${1:-test-job}"
+    echo "Sending test alert for job '${job_name}'..."
+    send_alert "$job_name" "TEST_ALERT" \
+        "Synthetic test alert generated by 'cronwatch test-alert'" \
+        "Diagnostics verification of syslog (logger) and AWS SNS pipeline" \
+        "Sample diagnostic output: test executed successfully" \
+        "WARNING"
+    echo "[OK] Syslog alert logged via logger (user.warning)."
+    if [[ -n "${CRONWATCH_SNS_TOPIC_ARN:-}" ]]; then
+        echo "[OK] Dispatched notification to AWS SNS Topic: ${CRONWATCH_SNS_TOPIC_ARN}"
+    else
+        echo "[INFO] CRONWATCH_SNS_TOPIC_ARN is not configured. To enable SNS notifications, set CRONWATCH_SNS_TOPIC_ARN in ${CRONWATCH_CONFIG_DIR}/cronwatch.env or environment."
+    fi
+}
+
 usage() {
     cat <<EOF
 cronwatch v${VERSION} - Detect silent cron job failures on Linux
@@ -859,6 +944,8 @@ Commands:
   doctor [script...]
       Diagnose common causes of silent cron failure (service status,
       CRLF, permissions, trailing newlines, PATH/env differences).
+  test-alert [job-name]
+      Send a synthetic test alert to verify syslog and AWS SNS delivery.
   version
       Print version information.
   help
@@ -872,6 +959,7 @@ Environment Variables:
   CRONWATCH_CONFIG_DIR    Configuration directory (default: /etc/cron-watchdog)
   CRONWATCH_CONFIG_FILE   Configuration file path (default: <CRONWATCH_CONFIG_DIR>/jobs.conf)
   CRONWATCH_SNS_TOPIC_ARN AWS SNS Topic ARN for publishing alert notifications
+  AWS_REGION              AWS Region for SNS (default: ap-south-1)
 EOF
 }
 
@@ -895,6 +983,10 @@ main() {
             ;;
         doctor)
             cmd_doctor "$@"
+            exit $?
+            ;;
+        test-alert)
+            cmd_test_alert "$@"
             exit $?
             ;;
         version|--version|-v)

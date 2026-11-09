@@ -4,3 +4,5 @@
 bin/* text eol=lf
 tests/*.bats text eol=lf
 
+# Intentional CRLF script for testing and demo
+demo/fail_crlf.sh text eol=crlf
