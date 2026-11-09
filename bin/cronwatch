@@ -45,6 +45,16 @@ json_escape() {
     printf '%s' "$s"
 }
 
+# Global cleanup handler for temporary files on script exit or termination
+_CRONWATCH_STDERR_TMP=""
+# shellcheck disable=SC2317
+cronwatch_cleanup() {
+    if [[ -n "${_CRONWATCH_STDERR_TMP:-}" && -f "$_CRONWATCH_STDERR_TMP" ]]; then
+        rm -f "$_CRONWATCH_STDERR_TMP"
+    fi
+}
+trap cronwatch_cleanup EXIT INT TERM
+
 # Helper: send alert via syslog (logger) and optionally AWS SNS
 # Uses EC2 IAM instance profile credentials (IMDSv2) automatically - never access keys.
 send_alert() {
@@ -215,13 +225,7 @@ cmd_run() {
     local stderr_tmp
     stderr_tmp=$(mktemp "${TMPDIR:-/tmp}/cronwatch-stderr.XXXXXX" 2>/dev/null || echo "/tmp/cronwatch-stderr.$$.$RANDOM")
     touch "$stderr_tmp" 2>/dev/null || true
-
-    cleanup() {
-        if [[ -n "${stderr_tmp:-}" && -f "$stderr_tmp" ]]; then
-            rm -f "$stderr_tmp"
-        fi
-    }
-    trap cleanup EXIT INT TERM
+    _CRONWATCH_STDERR_TMP="$stderr_tmp"
 
     # Execute wrapped command
     if [[ -n "$timeout_secs" ]]; then
@@ -714,14 +718,14 @@ doctor_check_crlf() {
     done
 
     if [[ ${#crlf_found[@]} -eq 0 ]]; then
-        echo "[PASS] Line Endings: No Windows CRLF (\\r\\n) line endings detected in checked scripts"
+        printf '%s\n' "[PASS] Line Endings: No Windows CRLF (\r\n) line endings detected in checked scripts"
         return 0
     else
-        echo "[FAIL] Line Endings: Windows CRLF (\\r\\n) line endings detected (causes '/bin/bash^M: bad interpreter'):"
+        printf '%s\n' "[FAIL] Line Endings: Windows CRLF (\r\n) line endings detected (causes '/bin/bash^M: bad interpreter'):"
         for f in "${crlf_found[@]}"; do
-            echo "       - $f"
+            printf '       - %s\n' "$f"
         done
-        echo "       Hint: Run 'sed -i \"s/\\r$//\" <script>' or 'dos2unix <script>' to convert to Unix LF."
+        printf '%s\n' "       Hint: Run 'sed -i \"s/\r$//\" <script>' or 'dos2unix <script>' to convert to Unix LF."
         return 1
     fi
 }

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2317,SC2034
 #
 # tests/run_tests.sh - Comprehensive automated test suite for cronwatch
 #
