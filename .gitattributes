@@ -3,3 +3,4 @@
 *.sh text eol=lf
 bin/* text eol=lf
 tests/*.bats text eol=lf
+

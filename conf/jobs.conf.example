@@ -1,0 +1,19 @@
+# Example configuration for cron-watchdog
+# Place at /etc/cron-watchdog/jobs.conf
+#
+# Format:
+#   <job-name> <max_allowed_age_minutes> [max_duration_seconds]
+#
+# Fields:
+#   job-name:             Unique name matching the 'cronwatch run <job-name>' parameter
+#   max_age_minutes:      Alert if last successful run is older than this threshold
+#   max_duration_seconds: (Optional) Alert if job execution duration exceeds this limit
+#
+# Examples:
+#   backup-db       15    120   # Runs every 10m, alert if missed for 15m, or takes >120s
+#   hourly-reports  65          # Runs every 60m, grace period of 5m
+#   daily-cleanup   1450  300   # Runs every 24h (1440m) + 10m grace period
+
+backup-db 15 120
+hourly-reports 65
+daily-cleanup 1450 300

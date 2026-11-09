@@ -4,7 +4,7 @@
 #
 # A lightweight, pure-Bash tool built for Linux production environments.
 # Wraps cron jobs, tracks execution metrics, maintains per-job heartbeats,
-# and diagnoses silent failure modes.
+# detects silent failures, and diagnoses host misconfigurations.
 #
 
 set -euo pipefail
@@ -18,6 +18,7 @@ CRONWATCH_STATE_DIR="${CRONWATCH_STATE_DIR:-/var/lib/cron-watchdog}"
 CRONWATCH_HEARTBEAT_DIR="${CRONWATCH_HEARTBEAT_DIR:-${CRONWATCH_STATE_DIR}/heartbeats}"
 CRONWATCH_CONFIG_DIR="${CRONWATCH_CONFIG_DIR:-/etc/cron-watchdog}"
 CRONWATCH_CONFIG_FILE="${CRONWATCH_CONFIG_FILE:-${CRONWATCH_CONFIG_DIR}/jobs.conf}"
+CRONWATCH_SNS_TOPIC_ARN="${CRONWATCH_SNS_TOPIC_ARN:-}"
 
 # Helper: escape strings for pure-bash JSON serialization
 json_escape() {
@@ -31,6 +32,40 @@ json_escape() {
     s="${s//$'\r'/\\r}"
     s="${s//$'\t'/\\t}"
     printf '%s' "$s"
+}
+
+# Helper: send alert via syslog (logger) and optionally AWS SNS (Stage 4)
+send_alert() {
+    local job_name="$1"
+    local alert_type="$2"
+    local message="$3"
+    local details="${4:-}"
+
+    local log_msg="CRITICAL: [cronwatch] Job '${job_name}' alert ${alert_type}: ${message}"
+    if [[ -n "$details" ]]; then
+        log_msg="${log_msg} | Details: ${details}"
+    fi
+
+    # Always log via logger (syslog / journald)
+    if command -v logger >/dev/null 2>&1; then
+        logger -t cronwatch -p user.err "$log_msg" 2>/dev/null || true
+    fi
+
+    # AWS SNS dispatch will be wired in Stage 4
+    if [[ -n "$CRONWATCH_SNS_TOPIC_ARN" ]] && command -v aws >/dev/null 2>&1; then
+        local sns_subject="[cronwatch alert] ${job_name}: ${alert_type}"
+        local sns_body="Host: $(hostname 2>/dev/null || echo 'unknown')
+Job: ${job_name}
+Alert: ${alert_type}
+Message: ${message}
+Timestamp: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+${details}"
+        aws sns publish \
+            --topic-arn "$CRONWATCH_SNS_TOPIC_ARN" \
+            --subject "$sns_subject" \
+            --message "$sns_body" >/dev/null 2>&1 || true
+    fi
 }
 
 # Subcommand: run
@@ -164,7 +199,7 @@ cmd_run() {
         stderr_tail=$(tail -n 20 "$stderr_tmp")
     fi
 
-    # On success: update per-job heartbeat file
+    # On success: update per-job heartbeat file atomically
     if [[ "$status" == "SUCCESS" ]]; then
         if ! mkdir -p "$CRONWATCH_HEARTBEAT_DIR" 2>/dev/null; then
             echo "cronwatch: warning: cannot create heartbeat directory: $CRONWATCH_HEARTBEAT_DIR" >&2
@@ -219,12 +254,244 @@ EOF
     return "$exit_code"
 }
 
-# Subcommand stubs for future stages
+# Subcommand: check
+# Usage: cronwatch check [--quiet]
 cmd_check() {
-    echo "cronwatch: 'check' will be implemented in Stage 2" >&2
-    return 1
+    local quiet_mode=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -q|--quiet)
+                quiet_mode=true
+                shift
+                ;;
+            -h|--help)
+                echo "Usage: cronwatch check [--quiet]"
+                echo "Inspect configured jobs in $CRONWATCH_CONFIG_FILE and report failures, missed runs, or slow jobs."
+                return 0
+                ;;
+            *)
+                echo "cronwatch: error: unknown option for check: $1" >&2
+                return 2
+                ;;
+        esac
+    done
+
+    # Check configuration existence
+    if [[ ! -f "$CRONWATCH_CONFIG_FILE" ]]; then
+        echo "cronwatch: error: configuration file not found: $CRONWATCH_CONFIG_FILE" >&2
+        echo "cronwatch: hint: create $CRONWATCH_CONFIG_FILE with format '<job-name> <max_age_minutes> [max_duration_seconds]'" >&2
+        return 2
+    fi
+
+    local total_checked=0
+    local total_failed=0
+    local total_warnings=0
+    local now_epoch
+    now_epoch=$(date +%s)
+
+    local report_lines=()
+
+    # Read jobs configuration line by line
+    while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+        # Strip comments and trim leading/trailing whitespace
+        local clean_line="${raw_line%%#*}"
+        clean_line=$(echo "$clean_line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+
+        [[ -z "$clean_line" ]] && continue
+
+        # Parse line: job_name, max_age_min, optional max_duration_sec
+        local job_name=""
+        local max_age_min=""
+        local max_duration_sec=""
+        read -r job_name max_age_min max_duration_sec _ <<< "$clean_line"
+
+        if [[ -z "$job_name" || -z "$max_age_min" ]]; then
+            echo "cronwatch: warning: invalid config line ignored: '$raw_line'" >&2
+            continue
+        fi
+
+        if ! [[ "$max_age_min" =~ ^[0-9]+$ ]] || [[ "$max_age_min" -le 0 ]]; then
+            echo "cronwatch: warning: invalid max_age '$max_age_min' for job '$job_name'" >&2
+            continue
+        fi
+
+        total_checked=$(( total_checked + 1 ))
+        local job_failed=false
+        local job_warning=false
+        local job_issues=()
+        local job_details=()
+
+        # -------------------------------------------------------------
+        # Condition 1: Heartbeat check (missed schedule or never ran)
+        # -------------------------------------------------------------
+        local heartbeat_file="${CRONWATCH_HEARTBEAT_DIR}/${job_name}"
+        local last_success_epoch=""
+        local last_success_iso=""
+
+        if [[ -f "$heartbeat_file" ]]; then
+            # Extract recorded timestamp from heartbeat file
+            if grep -q "^LAST_SUCCESS_EPOCH=" "$heartbeat_file" 2>/dev/null; then
+                last_success_epoch=$(grep "^LAST_SUCCESS_EPOCH=" "$heartbeat_file" | head -n 1 | cut -d'=' -f2)
+            fi
+            if grep -q "^LAST_SUCCESS_ISO=" "$heartbeat_file" 2>/dev/null; then
+                last_success_iso=$(grep "^LAST_SUCCESS_ISO=" "$heartbeat_file" | head -n 1 | cut -d'=' -f2)
+            fi
+
+            # Fallback to filesystem mtime if epoch wasn't read
+            if [[ -z "$last_success_epoch" || ! "$last_success_epoch" =~ ^[0-9]+$ ]]; then
+                last_success_epoch=$(stat -c %Y "$heartbeat_file" 2>/dev/null || stat -f %m "$heartbeat_file" 2>/dev/null || echo "$now_epoch")
+            fi
+
+            local age_seconds=$(( now_epoch - last_success_epoch ))
+            [[ "$age_seconds" -lt 0 ]] && age_seconds=0
+            local age_minutes=$(( age_seconds / 60 ))
+            local max_age_seconds=$(( max_age_min * 60 ))
+
+            if [[ "$age_seconds" -gt "$max_age_seconds" ]]; then
+                job_failed=true
+                local issue_msg="MISSED_HEARTBEAT (last success ${age_minutes}m ago at ${last_success_iso:-unknown}, max allowed ${max_age_min}m)"
+                job_issues+=("$issue_msg")
+                send_alert "$job_name" "MISSED_HEARTBEAT" "$issue_msg" "Heartbeat file: $heartbeat_file"
+            fi
+        else
+            # Heartbeat file does not exist
+            job_failed=true
+            local issue_msg="NEVER_RAN (no heartbeat file found at ${heartbeat_file})"
+            job_issues+=("$issue_msg")
+            send_alert "$job_name" "NEVER_RAN" "$issue_msg" "Heartbeat file missing"
+        fi
+
+        # -------------------------------------------------------------
+        # Condition 2: Latest execution check (non-zero or timed out)
+        # -------------------------------------------------------------
+        local latest_entry=""
+        if [[ -f "$CRONWATCH_LOG_FILE" ]]; then
+            latest_entry=$(grep "\"job_name\":\"${job_name}\"" "$CRONWATCH_LOG_FILE" 2>/dev/null | tail -n 1 || true)
+        fi
+
+        local latest_duration=0
+        local latest_status=""
+        local latest_exit_code=0
+        local latest_time=""
+        local latest_stderr=""
+
+        if [[ -n "$latest_entry" ]]; then
+            if [[ "$latest_entry" =~ \"status\":\"([^\"]*)\" ]]; then
+                latest_status="${BASH_REMATCH[1]}"
+            fi
+            if [[ "$latest_entry" =~ \"exit_code\":([0-9]+) ]]; then
+                latest_exit_code="${BASH_REMATCH[1]}"
+            fi
+            if [[ "$latest_entry" =~ \"duration_seconds\":([0-9]+) ]]; then
+                latest_duration="${BASH_REMATCH[1]}"
+            fi
+            if [[ "$latest_entry" =~ \"timestamp\":\"([^\"]*)\" ]]; then
+                latest_time="${BASH_REMATCH[1]}"
+            fi
+
+            # Extract stderr tail if present
+            if command -v jq >/dev/null 2>&1; then
+                latest_stderr=$(echo "$latest_entry" | jq -r '.stderr_tail // empty' 2>/dev/null || true)
+            else
+                if [[ "$latest_entry" =~ \"stderr_tail\":\"(.*)\"\} ]]; then
+                    latest_stderr="${BASH_REMATCH[1]}"
+                fi
+            fi
+
+            if [[ "$latest_status" == "FAILED" ]]; then
+                job_failed=true
+                local fail_msg="EXIT_NONZERO (exit code ${latest_exit_code} at ${latest_time})"
+                job_issues+=("$fail_msg")
+                if [[ -n "$latest_stderr" ]]; then
+                    job_details+=("stderr: ${latest_stderr}")
+                fi
+                send_alert "$job_name" "EXIT_NONZERO" "$fail_msg" "Stderr tail: ${latest_stderr}"
+            elif [[ "$latest_status" == "TIMED_OUT" ]]; then
+                job_failed=true
+                local timeout_msg="TIMED_OUT (killed after ${latest_duration}s at ${latest_time})"
+                job_issues+=("$timeout_msg")
+                if [[ -n "$latest_stderr" ]]; then
+                    job_details+=("stderr: ${latest_stderr}")
+                fi
+                send_alert "$job_name" "TIMED_OUT" "$timeout_msg" "Stderr tail: ${latest_stderr}"
+            fi
+
+            # -------------------------------------------------------------
+            # Condition 3: Duration check (exceeded limit or anomaly)
+            # -------------------------------------------------------------
+            # Check A: Explicit max_duration_sec configured in jobs.conf
+            if [[ -n "$max_duration_sec" && "$max_duration_sec" =~ ^[0-9]+$ && "$max_duration_sec" -gt 0 ]]; then
+                if [[ "$latest_duration" -gt "$max_duration_sec" ]]; then
+                    job_warning=true
+                    local dur_msg="DURATION_EXCEEDED (last run took ${latest_duration}s, configured max ${max_duration_sec}s)"
+                    job_issues+=("$dur_msg")
+                    send_alert "$job_name" "DURATION_EXCEEDED" "$dur_msg" ""
+                fi
+            fi
+
+            # Check B: Runtime anomaly vs historical successful runs (>3x average, min 15s)
+            local past_durations=()
+            while read -r d; do
+                [[ -n "$d" && "$d" =~ ^[0-9]+$ ]] && past_durations+=("$d")
+            done < <(grep "\"job_name\":\"${job_name}\"" "$CRONWATCH_LOG_FILE" 2>/dev/null | grep '"status":"SUCCESS"' | tail -n 10 | sed -n 's/.*"duration_seconds":\([0-9]*\).*/\1/p' || true)
+
+            # Need at least 3 historical successful runs to compute meaningful baseline
+            if [[ ${#past_durations[@]} -ge 3 ]]; then
+                local dur_sum=0
+                for d in "${past_durations[@]}"; do
+                    dur_sum=$(( dur_sum + d ))
+                done
+                local dur_avg=$(( dur_sum / ${#past_durations[@]} ))
+                if [[ "$dur_avg" -gt 0 && "$latest_duration" -ge $(( dur_avg * 3 )) && "$latest_duration" -ge 15 ]]; then
+                    job_warning=true
+                    local anomaly_msg="DURATION_ANOMALY (last run took ${latest_duration}s, baseline average is ${dur_avg}s [>3x])"
+                    job_issues+=("$anomaly_msg")
+                    send_alert "$job_name" "DURATION_ANOMALY" "$anomaly_msg" "Historical samples: ${past_durations[*]}"
+                fi
+            fi
+        fi
+
+        # Collate reporting state for this job
+        if [[ "$job_failed" == true ]]; then
+            total_failed=$(( total_failed + 1 ))
+            report_lines+=("[FAIL] ${job_name}: $(IFS='; '; echo "${job_issues[*]}")")
+            for det in "${job_details[@]}"; do
+                report_lines+=("       ${det}")
+            done
+        elif [[ "$job_warning" == true ]]; then
+            total_warnings=$(( total_warnings + 1 ))
+            report_lines+=("[WARN] ${job_name}: $(IFS='; '; echo "${job_issues[*]}")")
+        else
+            local succ_age="unknown"
+            if [[ -n "$last_success_epoch" ]]; then
+                local ok_age_sec=$(( now_epoch - last_success_epoch ))
+                succ_age="$(( ok_age_sec / 60 ))m"
+            fi
+            report_lines+=("[OK]   ${job_name}: healthy (last success ${succ_age} ago, last duration ${latest_duration}s)")
+        fi
+
+    done < "$CRONWATCH_CONFIG_FILE"
+
+    # In quiet mode, only output if failures or warnings exist
+    if [[ "$quiet_mode" == true ]]; then
+        if [[ "$total_failed" -gt 0 || "$total_warnings" -gt 0 ]]; then
+            printf '%s\n' "${report_lines[@]}"
+            echo "Summary: ${total_checked} checked, ${total_failed} failed, ${total_warnings} warnings."
+        fi
+    else
+        printf '%s\n' "${report_lines[@]}"
+        echo "Summary: ${total_checked} checked, ${total_failed} failed, ${total_warnings} warnings."
+    fi
+
+    # Exit code: 1 if any job failed, 0 if healthy (or only warnings)
+    if [[ "$total_failed" -gt 0 ]]; then
+        return 1
+    fi
+    return 0
 }
 
+# Subcommand stub for future stage
 cmd_doctor() {
     echo "cronwatch: 'doctor' will be implemented in Stage 3" >&2
     return 1
@@ -241,8 +508,9 @@ Commands:
   run <job-name> [--timeout N] -- <command...>
       Execute a cron command wrapped with monitoring. Records metrics to
       $CRONWATCH_LOG_FILE and updates heartbeat on success.
-  check
-      Inspect configured jobs, detect missed schedules, failures, and slow runs.
+  check [--quiet]
+      Inspect configured jobs in $CRONWATCH_CONFIG_FILE.
+      Detects missed schedules, exit errors, timeouts, and slow runs.
   doctor
       Diagnose common cron issues (service status, permissions, CRLF, PATH, etc.).
   version
@@ -257,6 +525,7 @@ Environment Variables:
   CRONWATCH_HEARTBEAT_DIR Heartbeats directory (default: <CRONWATCH_STATE_DIR>/heartbeats)
   CRONWATCH_CONFIG_DIR    Configuration directory (default: /etc/cron-watchdog)
   CRONWATCH_CONFIG_FILE   Configuration file path (default: <CRONWATCH_CONFIG_DIR>/jobs.conf)
+  CRONWATCH_SNS_TOPIC_ARN AWS SNS Topic ARN for publishing alert notifications
 EOF
 }
 
