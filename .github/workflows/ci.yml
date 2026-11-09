@@ -40,3 +40,4 @@ jobs:
       - name: Run end-to-end sandbox demo
         run: |
           ./demo/run_all_demos.sh
+

@@ -96,3 +96,4 @@ teardown() {
     [ "$status" -eq 1 ]
     [[ "$output" =~ "Script is not marked executable" ]]
 }
+

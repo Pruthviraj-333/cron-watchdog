@@ -1,0 +1,9 @@
+# infra/terraform.tfvars.example
+# Copy to infra/terraform.tfvars and customize if necessary
+
+aws_region         = "ap-south-1"
+alert_email        = "pruthvirajraj333@gmail.com"
+operator_ip        = "103.151.234.231/32"
+instance_type      = "t3.micro"
+key_name           = "key_pair_mum"
+monthly_budget_usd = "5.0"
